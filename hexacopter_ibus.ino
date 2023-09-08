@@ -2,14 +2,21 @@
 #include <SoftwareSerial.h>
 #include "src/FlySkyIBus/FlySkyIBus.h"
 #include <Adafruit_PWMServoDriver.h>
+#include <Math.h>
 
-// Constants
+// Constants //
 #define PWMnbr 16
 const int numInputChannels = 10;
 const int failsafelimit = 100;
 const int offVal = 900;
-
+const int minVal = 1000;
+const int maxVal = 2000;
 const int MPU_addr=0x68;
+// Constants END //
+
+// GYRO //
+const float Fa = 0.98; // smoothing factor
+
 int16_t AcX,AcY,AcZ,Tmp,GyX,GyY,GyZ;
 
 int GminVal=265;
@@ -18,26 +25,43 @@ int GmaxVal=402;
 double x;
 double y;
 double z;
+double Fx=0;
+double Fy=0;
 
 int cX=0;
 int cY=0;
 int cZ=0;
+// GYRO END //
 
+// IBUS RX //
 SoftwareSerial iBusSerial(8, 9); // RX, TX
 FlySkyIBus iBus;
 int LastInput[numInputChannels];
 int channelInput[numInputChannels];
+// IBUS RX END //
+
+// FC VARS //
 int motorVals[6]; // 6 motors values
-int minVal = 1000;
-int maxVal = 2000;
 unsigned long ts;
 int status = 0;
-bool armed = false;
 bool change=false;
+
+bool armed = false;
+bool stab = true;
+
+int xTargetAngle=0;
+int yTargetAngle=0;
+const int MaxAngle = 30;
+
+const int MaxTurningSpeed = 50;
+const int MinTurningSpeed = 10;
+// FC VARS END //
+
+int ease(float v){ return(int( ((v/MaxAngle)*(v/MaxAngle)) * MaxTurningSpeed )); } // f(x)= x^2 : ease-out
 
 Adafruit_PWMServoDriver mdv = Adafruit_PWMServoDriver(0x40);
 
-int lrm=millis();
+unsigned long lrm=millis();
 
 void setup() {
   mdv.begin();
@@ -71,17 +95,18 @@ void loop() {
 
   // GYRO data
   readGyro();
-  if ((millis()-lrm) > 1000) {
+  /*if ((millis()-lrm) > 1000) {
+    lrm=millis();
+
     Serial.print("X:");
     Serial.print(int(x));
 
     Serial.print(",Y:");
     Serial.print(int(y));
+  }*/
 
-    Serial.print(",Z:");
-    Serial.print(int(z));
-    Serial.println("");
-  }
+  Fx = Fa*Fx + (1-Fa) * x;
+  Fy = Fa*Fy + (1-Fa) * y;
 
   // RX data
   if (iBus.loop()) {
@@ -119,7 +144,36 @@ void loop() {
       armed=false;
     }
 
-    if (armed) {
+    if (channelInput[6] != LastInput[6]) { // callibration stick
+      if (channelInput[6] > 1200) {
+        Serial.print("Callibration ... ");
+        Callibrate();
+        Serial.println("Callibrated");
+        
+        /*Serial.print(cX);
+        Serial.print(", ");
+        Serial.println(cY);*/
+      } else {
+        Serial.println("Callibration reseted");
+        cX=0;
+        cY=0;
+        cZ=0; 
+      }
+    }
+
+    if (channelInput[7] != LastInput[7]) { // stabilisation stick
+      if (channelInput[7] > 1500) { // OFF
+        stab=false;
+
+        Serial.println("Stabilisation Desactivated");
+      } else { // ON
+        stab=true;
+
+        Serial.println("Stabilisation Activated");
+      }
+    }
+
+    if (armed) { // motors control
       if (true || channelInput[2]!=LastInput[2]) { // throttle
         if (channelInput[2] < 1025) {
           //channelInput[2]=900;
@@ -132,28 +186,60 @@ void loop() {
       if (true || channelInput[1]!=LastInput[1]) { // forward - backward
         if (channelInput[1] > 1500) { // forward
           int fv = channelInput[1]-1500;
-          motorVals[0] += fv;
-          motorVals[5] += fv;
+          if (stab) { // stab on
+            yTargetAngle = (MaxAngle*fv)/500;
+            //Serial.print("Ytarget:");
+            //Serial.print(yTargetAngle);
+            //Serial.print(", Xtarget:");
+          } else {
+            motorVals[0] += fv;
+            motorVals[5] += fv;
+          }
         } else if (channelInput[1] < 1500) { // backward
           int fv = 1500-channelInput[1];
-          motorVals[0] -= fv;
-          motorVals[5] -= fv;
+          if (stab) { // stab on
+            yTargetAngle = -((MaxAngle*fv)/500);
+            //Serial.print("Ytarget:");
+            //Serial.print(yTargetAngle);
+            //Serial.print(", Xtarget:");
+          } else {
+            motorVals[0] -= fv;
+            motorVals[5] -= fv;
+          }
+        } else {
+          yTargetAngle=0;
         }
       }
 
       if (true || channelInput[0]!=LastInput[0]) { // left - right
         if (channelInput[0] < 1500) { // left
           int fv = 1500-channelInput[0];
-          fv/=2; // divide by 2
-          motorVals[4] += fv;
-          motorVals[1] -= fv/2;
+          if (stab) { // stab on
+            xTargetAngle = -((MaxAngle*fv)/500);
+            //Serial.println(xTargetAngle);
+          } else {
+            fv/=2; // divide by 2
+            motorVals[4] += fv;
+            motorVals[1] -= fv/2;
+          }
         } else if (channelInput[0] > 1500) { // right
           int fv = channelInput[0]-1500;
-          fv/=2; // divide by 2
-          motorVals[1] += fv;
-          motorVals[4] -= fv/2;
-        } 
+          if (stab) {
+            xTargetAngle = ((MaxAngle*fv)/500);
+            //Serial.println(xTargetAngle);
+          } else {
+            fv/=2; // divide by 2
+            motorVals[1] += fv;
+            motorVals[4] -= fv/2;
+          }
+        }  else {
+          xTargetAngle = 0;
+        }
       }
+
+      /*Serial.print(yTargetAngle);
+      Serial.print(", ");
+      Serial.println(xTargetAngle);*/
 
       if (channelInput[3] < 1500) { // turn left
         int fv = 1500-channelInput[3];
@@ -174,6 +260,51 @@ void loop() {
             motorVals[i]=2000;
             motorVals[(i+3)%6] -= a;
           }
+        }
+      }
+
+      if (stab) { // change motor values to attain the target angle
+        int xDiff = xTargetAngle - Fx;
+        int yDiff = yTargetAngle - Fy;
+        // yDiff pos : avant
+        // xDiff pos : droite
+      
+        /*Serial.print("yDiff:");
+        Serial.print(yDiff);
+        Serial.print(", xDiff:");
+        Serial.println(xDiff);*/
+
+        Serial.print(Fy);
+        Serial.print(" -> ");
+
+        int easedVal = ease(constrain(abs(yDiff), 0, MaxAngle));
+        Serial.print(easedVal);
+        //Serial.print("Yeased:");
+        //Serial.print(easedVal);
+        if (yDiff > 0) { // avant
+          motorVals[0] += easedVal;
+          motorVals[5] += easedVal;
+        } else if (yDiff < 0) { // arrière
+          motorVals[2] += easedVal;
+          motorVals[3] += easedVal;
+        }
+
+        Serial.print(", ");
+        Serial.print(Fx);
+        Serial.print(" -> ");
+
+        easedVal = ease(constrain(abs(xDiff), 0, MaxAngle));
+        Serial.println(easedVal);
+        //Serial.print(", Xeased:");
+        //Serial.println(easedVal);
+        if (xDiff > 0) { // droite
+          motorVals[0] += easedVal;
+          motorVals[1] += easedVal;
+          motorVals[2] += easedVal;
+        } else if (xDiff < 0) { // gauche
+          motorVals[3] += easedVal;
+          motorVals[4] += easedVal;
+          motorVals[5] += easedVal;
         }
       }
     }
@@ -200,15 +331,15 @@ void loop() {
           }
         }*/
 
-        if (i!=0) {
+        /*if (i!=0) {
           Serial.print(",");
         }
         Serial.print("Motor_");
         Serial.print(i);
         Serial.print(":");
-        Serial.print(motorVals[i]);
+        Serial.print(motorVals[i]);*/
       }
-      Serial.print("\n");
+      //Serial.print("\n");
 
       for(int i=0; i<6; i++) {
         mdv.writeMicroseconds(i, motorVals[i]);
@@ -272,9 +403,9 @@ void readGyro() {
   y= RAD_TO_DEG * (atan2(-xAng, -zAng)+PI);
   z= RAD_TO_DEG * (atan2(-yAng, -xAng)+PI);
 
-  x-=cX;
+  /*x-=cX;
   y-=cY;
-  z-=cZ;
+  z-=cZ;*/
 
   if (x > 180) {
     x= -360+x;
@@ -292,10 +423,14 @@ void readGyro() {
   } else if (z < -180) {
     z= -360-z;
   }
+
+  x-=cX;
+  y-=cY;
+  z-=cZ;
 }
 
 void Callibrate() {
-  Wire.beginTransmission(MPU_addr);
+  /*Wire.beginTransmission(MPU_addr);
   Wire.write(0x3B);
   Wire.endTransmission(false);
   Wire.requestFrom(MPU_addr,14,true);
@@ -310,6 +445,10 @@ void Callibrate() {
   x= RAD_TO_DEG * (atan2(-yAng, -zAng)+PI);
   y= RAD_TO_DEG * (atan2(-xAng, -zAng)+PI);
   z= RAD_TO_DEG * (atan2(-yAng, -xAng)+PI);
+
+  cX=x;
+  cY=y;
+  cZ=z;*/
 
   cX=x;
   cY=y;
